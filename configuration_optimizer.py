@@ -1,6 +1,6 @@
 """Optimize a black-box algorithm with constrained configuration parameters."""
 
-from typing import Union, Dict, Tuple, List
+from typing import Union, Dict, Tuple, List, Optional
 
 import json
 
@@ -44,9 +44,10 @@ class ConfigurationOptimizer:
                  target: str,
                  max_unclassified: float,
                  verify: Union[bool, str] = True,
-                 http_basic_username: str = None,
-                 http_basic_password: str = None,
-                 seed: int = 0) -> None:
+                 http_basic_username: Optional[str] = None,
+                 http_basic_password: Optional[str] = None,
+                 read_only: bool = False,
+                 seed: int = 1) -> None:
         """
         Parameters:
             base_uri: The base URI of the HTTP API.
@@ -64,8 +65,12 @@ class ConfigurationOptimizer:
                     or not the SSL connection should be verified.
             http_basic_username: The username if using HTTP basic auth.
             http_basic_password: The password if using HTTP basic auth.
+            read_only: Whether to execute in read only (performance evaluation)
+                       mode.
             seed: The random seed of the algorithm.
         """
+        self.read_only = read_only
+
         self.base_uri = base_uri
         self.verify = verify
         if http_basic_username is None:
@@ -102,6 +107,12 @@ class ConfigurationOptimizer:
         # Specify variable order so that we can cache
         self._variables = list(config_spec.keys())
 
+        # Fetch current config and evaluate
+        self._current_config = self._fetch_current_config()
+        auroc = self._evaluate(self.read_only, output_filename)
+        if self.read_only:
+            return
+
         # Build the optimizer and resume from data if given
         self._optim = BayesianOptimization(
             f=self._configure_and_evaluate,
@@ -118,8 +129,6 @@ class ConfigurationOptimizer:
 
         # Fetch the current config and the corresponding scores and inform the
         # model
-        self._current_config = self._fetch_current_config()
-        auroc = self._evaluate()
         self._optim.register(
             params=self._current_config,
             target=auroc
@@ -148,9 +157,13 @@ class ConfigurationOptimizer:
 
         return self._evaluate()
 
-    def _evaluate(self) -> float:
+    def _evaluate(self,
+                  export_scores: bool = False,
+                  export_filename: Optional[str] = None) -> float:
         print("Evaluating...")
         scores, labels = self._scores()
+        if export_scores:
+            json.dump({"scores": scores, "labels": labels}, open(export_filename, "w"))
         auroc = roc_auc_score(labels, scores)
         print(f"  AUROC: {auroc}")
 
@@ -359,13 +372,14 @@ if __name__ == "__main__":
     parser.add_argument("--http_basic_username", type=str, default=None)
     parser.add_argument("--http_basic_password", type=str, default=None)
     parser.add_argument("--configuration_id", type=str, required=True)
-    parser.add_argument("--timeout", type=int, default=600)
+    parser.add_argument("--timeout", type=int, default=21600)
     parser.add_argument("--num_random_points", type=int, default=2)
     parser.add_argument("--max_iter", type=int, default=100)
     parser.add_argument("--target", type=str, choices=["f1", "accuracy"], required=True)
     parser.add_argument("--max_unclassified", type=float, default=0.2)
     parser.add_argument("--output_filename", type=str, required=True)
     parser.add_argument("--resume_filename", type=str, required=False)
+    parser.add_argument("--read_only", action="store_true", default=False)
     args = parser.parse_args()
 
     optimizer = ConfigurationOptimizer(
@@ -378,7 +392,8 @@ if __name__ == "__main__":
         target=args.target,
         max_unclassified=args.max_unclassified,
         http_basic_username=args.http_basic_username,
-        http_basic_password=args.http_basic_password
+        http_basic_password=args.http_basic_password,
+        read_only=args.read_only
     )
     optimizer.start(resume_filename=args.resume_filename,
                     output_filename=args.output_filename)
