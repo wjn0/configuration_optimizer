@@ -8,7 +8,7 @@ import requests
 
 from bayes_opt import BayesianOptimization, Events, JSONLogger, util
 
-from sklearn.metrics import roc_auc_score, f1_score, accuracy_score
+from sklearn.metrics import roc_auc_score, f1_score, accuracy_score, precision_score, recall_score
 
 import numpy as np
 
@@ -47,6 +47,7 @@ class ConfigurationOptimizer:
                  http_basic_username: Optional[str] = None,
                  http_basic_password: Optional[str] = None,
                  read_only: bool = False,
+                 thresholds_only: bool = False,
                  seed: int = 1) -> None:
         """
         Parameters:
@@ -58,7 +59,7 @@ class ConfigurationOptimizer:
                                to using model-guided optimization.
             max_iter: The maximum number of iterations that the optimizer will
                       perform.
-            target: One of "f1" or "accuracy".
+            target: One of "f1" or "accuracy" or "sensitivity".
             max_unclassified: The maximum proportion of unclassified data
                               allowed (between 0 and 1).
             verify: The path to a certificate file or a boolean as to whether
@@ -67,9 +68,11 @@ class ConfigurationOptimizer:
             http_basic_password: The password if using HTTP basic auth.
             read_only: Whether to execute in read only (performance evaluation)
                        mode.
+            thresholds_only: Whether to optimize only the thresholds.
             seed: The random seed of the algorithm.
         """
         self.read_only = read_only
+        self.thresholds_only = thresholds_only
 
         self.base_uri = base_uri
         self.verify = verify
@@ -110,7 +113,11 @@ class ConfigurationOptimizer:
         # Fetch current config and evaluate
         self._current_config = self._fetch_current_config()
         auroc = self._evaluate(self.read_only, output_filename)
-        if self.read_only:
+        if self.thresholds_only:
+            thresholds = self._optimize_thresholds(config=self._current_config)
+            self._configure(self._current_config, thresholds, True)
+            return
+        elif self.read_only:
             return
 
         # Build the optimizer and resume from data if given
@@ -306,30 +313,56 @@ class ConfigurationOptimizer:
         scores = np.asarray(self._scores_cache[_config])
         labels = np.asarray(self._labels_cache[_config]).astype(int)
 
+        # Compute the thresholds such that the precision and recall in the
+        # test set are 1., leaving the middle between the two thresholds as
+        # unclassified.
+        if self.target == "sensitivity":
+            max_nonmatch_score = np.max(scores[labels == 0])
+            upper_thresh = np.min(scores[scores > max_nonmatch_score])
+            min_match_score = np.min(scores[labels == 1])
+            lower_thresh = np.max(scores[scores <= min_match_score]) - 1e-8
+            # Make sure we haven't exceeded the `max_unclassified` allowance
+            upper_q = np.mean(scores <= upper_thresh)
+            lower_q = np.mean(scores <= lower_thresh)
+            if (upper_q - lower_q) > self.max_unclassified:
+                lower_q = upper_q - self.max_unclassified
+                lower_thresh = np.quantile(scores, lower_q)
+            pred = np.asarray([-9] * len(labels)).astype(int)
+            pred[scores <= lower_thresh] = 0
+            pred[scores >= upper_thresh] = 1
+            sel = (pred >= 0)
+            thresholds = (lower_thresh, upper_thresh)
+            prec = precision_score(labels[sel], pred[sel])
+            sens = recall_score(labels[sel], pred[sel])
+            prop_unc = np.mean(pred < 0)
+            print(f"Achieved precision of {prec} and recall of {sens} with "
+                  f"thresholds {thresholds}, with {prop_unc} of the data "
+                  "unclassified")
         # For a lower threshold based on score quantiles, compute the upper
         # threshold such that at most `self.max_unclassified` data is
         # unclassified and compute the corresponding f1 or accuracy score
-        metric = {}
-        for lower_q in np.arange(0., 1., step=0.001):
-            upper_q = lower_q + self.max_unclassified
-            pred = np.asarray([-9] * len(labels)).astype(int)
-            if upper_q >= 1.:
-                break
-            lower_thresh = np.quantile(scores, lower_q)
-            upper_thresh = np.quantile(scores, upper_q)
-            pred[scores < lower_thresh] = 0
-            pred[scores > upper_thresh] = 1
-            sel = (pred >= 0)
-            if self.target == "f1":
-                metric_fn = f1_score
-            elif self.target == "accuracy":
-                metric_fn = accuracy_score
-            metric[(lower_thresh, upper_thresh)] = metric_fn(labels[sel],
-                                                             pred[sel])
-        thresholds = max(metric.keys(), key=lambda k: metric[k])
+        else:
+            metric = {}
+            for lower_q in np.arange(0., 1., step=0.001):
+                upper_q = lower_q + self.max_unclassified
+                pred = np.asarray([-9] * len(labels)).astype(int)
+                if upper_q >= 1.:
+                    break
+                lower_thresh = np.quantile(scores, lower_q)
+                upper_thresh = np.quantile(scores, upper_q)
+                pred[scores < lower_thresh] = 0
+                pred[scores > upper_thresh] = 1
+                sel = (pred >= 0)
+                if self.target == "f1":
+                    metric_fn = f1_score
+                elif self.target == "accuracy":
+                    metric_fn = accuracy_score
+                metric[(lower_thresh, upper_thresh)] = metric_fn(labels[sel],
+                                                                 pred[sel])
+            thresholds = max(metric.keys(), key=lambda k: metric[k])
 
-        print(f"Achieved {self.target} of {metric[thresholds]} "
-              f"with thresholds {thresholds}")
+            print(f"Achieved {self.target} of {metric[thresholds]} "
+                  f"with thresholds {thresholds}")
 
         return thresholds
 
@@ -375,11 +408,12 @@ if __name__ == "__main__":
     parser.add_argument("--timeout", type=int, default=21600)
     parser.add_argument("--num_random_points", type=int, default=2)
     parser.add_argument("--max_iter", type=int, default=100)
-    parser.add_argument("--target", type=str, choices=["f1", "accuracy"], required=True)
+    parser.add_argument("--target", type=str, choices=["f1", "accuracy", "sensitivity"], required=True)
     parser.add_argument("--max_unclassified", type=float, default=0.2)
     parser.add_argument("--output_filename", type=str, required=True)
     parser.add_argument("--resume_filename", type=str, required=False)
     parser.add_argument("--read_only", action="store_true", default=False)
+    parser.add_argument("--thresholds_only", action="store_true", default=False)
     args = parser.parse_args()
 
     optimizer = ConfigurationOptimizer(
@@ -393,7 +427,8 @@ if __name__ == "__main__":
         max_unclassified=args.max_unclassified,
         http_basic_username=args.http_basic_username,
         http_basic_password=args.http_basic_password,
-        read_only=args.read_only
+        read_only=args.read_only,
+        thresholds_only=args.thresholds_only,
     )
     optimizer.start(resume_filename=args.resume_filename,
                     output_filename=args.output_filename)
